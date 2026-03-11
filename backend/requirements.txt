@@ -13,7 +13,7 @@ alembic==1.12.1
 
 # AI/ML
 transformers==4.45.2
-torch==2.4.1
+torch==2.6.0
 openai==1.52.1
 anthropic==0.39.0
 

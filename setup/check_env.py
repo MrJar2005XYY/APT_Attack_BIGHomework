@@ -94,6 +94,7 @@ class EnvironmentChecker:
             common_paths = [
                 r"C:\Program Files\nodejs\npm.cmd",
                 r"C:\Program Files (x86)\nodejs\npm.cmd",
+                r"C:\Program Files\nodejs\npm.ps1",
             ]
         elif cmd == 'python':
             common_paths = [
@@ -105,16 +106,31 @@ class EnvironmentChecker:
         for path in common_paths:
             if os.path.exists(path):
                 try:
-                    result = subprocess.run(
-                        [path, '--version'],
-                        capture_output=True,
-                        text=True,
-                        timeout=10
-                    )
+                    # 对于 .cmd 文件，需要使用 shell 执行
+                    if path.endswith('.cmd') or path.endswith('.ps1'):
+                        result = subprocess.run(
+                            [path, '--version'],
+                            capture_output=True,
+                            text=True,
+                            timeout=10,
+                            shell=True
+                        )
+                    else:
+                        result = subprocess.run(
+                            [path, '--version'],
+                            capture_output=True,
+                            text=True,
+                            timeout=10
+                        )
+                    
                     if result.returncode == 0 and result.stdout:
                         version = result.stdout.strip().split('\n')[0]
                         return True, version
-                except:
+                    # 某些情况下版本信息在 stderr
+                    if result.stderr and result.stderr.strip():
+                        version = result.stderr.strip().split('\n')[0]
+                        return True, version
+                except Exception as e:
                     continue
         
         return False, None
@@ -179,8 +195,35 @@ class EnvironmentChecker:
             print_error("Node.js 未安装")
             self.missing.append('node')
         
-        # 检查 npm
+        # 检查 npm - 增强检查逻辑
         installed, version = self.check_command('npm')
+        if not installed:
+            # 尝试通过 node 路径推断 npm 路径
+            node_path = shutil.which('node')
+            if node_path:
+                node_dir = Path(node_path).parent
+                npm_paths = [
+                    node_dir / 'npm.cmd',
+                    node_dir / 'npm.ps1',
+                    node_dir / 'npm',
+                ]
+                for npm_path in npm_paths:
+                    if npm_path.exists():
+                        try:
+                            result = subprocess.run(
+                                [str(npm_path), '--version'],
+                                capture_output=True,
+                                text=True,
+                                timeout=10,
+                                shell=True
+                            )
+                            if result.returncode == 0:
+                                installed = True
+                                version = result.stdout.strip() or result.stderr.strip()
+                                break
+                        except:
+                            continue
+        
         if installed:
             print_success(f"npm {version} 已安装")
         else:
