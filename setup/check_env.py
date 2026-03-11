@@ -57,16 +57,67 @@ class EnvironmentChecker:
     def check_command(self, cmd: str) -> Tuple[bool, Optional[str]]:
         """检查命令是否可用"""
         try:
+            # 尝试直接运行命令
             result = subprocess.run(
                 [cmd, '--version'],
                 capture_output=True,
                 text=True,
-                timeout=10
+                timeout=10,
+                shell=(platform.system() == 'Windows')  # Windows 下使用 shell
             )
-            version = result.stdout.strip().split('\n')[0] if result.stdout else 'Unknown'
-            return True, version
-        except (subprocess.SubprocessError, FileNotFoundError):
+            if result.returncode == 0:
+                version = result.stdout.strip().split('\n')[0] if result.stdout else 'Unknown'
+                return True, version
+            # 如果失败，尝试 stderr（某些程序输出版本信息到 stderr）
+            if result.stderr.strip():
+                version = result.stderr.strip().split('\n')[0]
+                return True, version
             return False, None
+        except (subprocess.SubprocessError, FileNotFoundError):
+            # Windows 特殊处理：尝试常见安装路径
+            if platform.system() == 'Windows':
+                return self._check_windows_command(cmd)
+            return False, None
+    
+    def _check_windows_command(self, cmd: str) -> Tuple[bool, Optional[str]]:
+        """Windows 下检查命令的增强方法"""
+        # 常见安装路径
+        common_paths = []
+        
+        if cmd == 'node':
+            common_paths = [
+                r"C:\Program Files\nodejs\node.exe",
+                r"C:\Program Files (x86)\nodejs\node.exe",
+                os.path.expanduser(r"~\AppData\Roaming\npm\node.exe"),
+            ]
+        elif cmd == 'npm':
+            common_paths = [
+                r"C:\Program Files\nodejs\npm.cmd",
+                r"C:\Program Files (x86)\nodejs\npm.cmd",
+            ]
+        elif cmd == 'python':
+            common_paths = [
+                os.path.expanduser(r"~\AppData\Local\Programs\Python\Python310\python.exe"),
+                os.path.expanduser(r"~\AppData\Local\Programs\Python\Python311\python.exe"),
+                os.path.expanduser(r"~\AppData\Local\Programs\Python\Python312\python.exe"),
+            ]
+        
+        for path in common_paths:
+            if os.path.exists(path):
+                try:
+                    result = subprocess.run(
+                        [path, '--version'],
+                        capture_output=True,
+                        text=True,
+                        timeout=10
+                    )
+                    if result.returncode == 0 and result.stdout:
+                        version = result.stdout.strip().split('\n')[0]
+                        return True, version
+                except:
+                    continue
+        
+        return False, None
     
     def check_python(self):
         """检查 Python 环境"""
@@ -497,67 +548,211 @@ SECRET_KEY=your-secret-key-here
         
         # 检查 Docker
         try:
-            subprocess.run(['docker', '--version'], check=True, capture_output=True)
-        except:
-            print_error("Docker 未安装，跳过 Docker 服务安装")
+            result = subprocess.run(['docker', '--version'], check=True, capture_output=True, text=True)
+            print_info(f"Docker 版本：{result.stdout.strip()}")
+        except subprocess.CalledProcessError as e:
+            print_error(f"Docker 未安装或无法访问：{e}")
+            print_info("请先安装 Docker Desktop: https://www.docker.com/products/docker-desktop")
+            return False
+        except FileNotFoundError:
+            print_error("Docker 命令未找到")
+            print_info("请确保 Docker 已安装并添加到系统 PATH")
+            return False
+        
+        # 检查 Docker 是否正在运行
+        try:
+            result = subprocess.run(['docker', 'info'], capture_output=True, text=True, timeout=5)
+            if result.returncode != 0:
+                print_error("Docker 服务未运行")
+                print_info("请启动 Docker Desktop 或 Docker 服务")
+                if 'permission denied' in result.stderr.lower() or 'access is denied' in result.stderr.lower():
+                    print_warning("权限问题：尝试以管理员身份运行此脚本")
+                return False
+        except subprocess.TimeoutExpired:
+            print_warning("Docker 响应超时，可能未正常运行")
             return False
         
         docker_compose_file = self.project_root / 'docker-compose.yml'
         
         if docker_compose_file.exists():
             print_info("使用 docker-compose 启动服务...")
+            
+            # 先尝试停止旧容器
             try:
                 subprocess.run(
+                    ['docker-compose', 'down'],
+                    cwd=str(self.project_root),
+                    capture_output=True,
+                    timeout=30
+                )
+            except:
+                pass
+            
+            try:
+                # 尝试 docker-compose
+                result = subprocess.run(
                     ['docker-compose', 'up', '-d', 'mysql', 'neo4j'],
                     cwd=str(self.project_root),
-                    check=True
+                    capture_output=True,
+                    text=True,
+                    timeout=120
                 )
-                print_success("数据库服务启动成功")
-                return True
-            except:
+                if result.returncode == 0:
+                    print_success("数据库服务启动成功")
+                    self._verify_docker_containers()
+                    return True
+                else:
+                    print_error(f"docker-compose 启动失败：{result.stderr}")
+                    raise Exception(result.stderr)
+            except Exception as e:
                 # 尝试 docker compose (新版本)
+                print_info("尝试使用 'docker compose' (Docker Compose V2)...")
                 try:
-                    subprocess.run(
+                    result = subprocess.run(
                         ['docker', 'compose', 'up', '-d', 'mysql', 'neo4j'],
                         cwd=str(self.project_root),
-                        check=True
+                        capture_output=True,
+                        text=True,
+                        timeout=120
                     )
-                    print_success("数据库服务启动成功")
-                    return True
+                    if result.returncode == 0:
+                        print_success("数据库服务启动成功")
+                        self._verify_docker_containers()
+                        return True
+                    else:
+                        print_error(f"docker compose 启动失败：{result.stderr}")
+                        self._diagnose_docker_issue(result.stderr)
+                        return False
                 except Exception as e:
                     print_error(f"启动服务失败：{e}")
+                    self._diagnose_docker_issue(str(e))
                     return False
         else:
             print_warning("未找到 docker-compose.yml，手动启动 Docker 服务...")
             
-            # 启动 MySQL
+            # 先停止可能存在的旧容器
             try:
-                subprocess.run([
+                subprocess.run(['docker', 'stop', 'mysql-apt'], capture_output=True, timeout=10)
+                subprocess.run(['docker', 'rm', 'mysql-apt'], capture_output=True, timeout=10)
+            except:
+                pass
+            
+            try:
+                subprocess.run(['docker', 'stop', 'neo4j-apt'], capture_output=True, timeout=10)
+                subprocess.run(['docker', 'rm', 'neo4j-apt'], capture_output=True, timeout=10)
+            except:
+                pass
+            
+            # 启动 MySQL
+            print_info("启动 MySQL 容器...")
+            try:
+                result = subprocess.run([
                     'docker', 'run', '-d',
                     '--name', 'mysql-apt',
                     '-e', 'MYSQL_ROOT_PASSWORD=root',
                     '-e', 'MYSQL_DATABASE=apt_intelligence',
                     '-p', '3306:3306',
                     'mysql:8.0'
-                ], check=True)
-                print_success("MySQL Docker 容器启动成功")
-            except:
-                print_warning("MySQL 容器可能已存在或启动失败")
+                ], capture_output=True, text=True, timeout=60)
+                
+                if result.returncode == 0:
+                    print_success("MySQL Docker 容器启动成功")
+                else:
+                    error_msg = result.stderr
+                    if 'port is already allocated' in error_msg.lower() or '3306' in error_msg:
+                        print_error(f"MySQL 启动失败：端口 3306 被占用")
+                        print_info("请停止占用 3306 端口的程序或使用其他端口")
+                    elif 'permission denied' in error_msg.lower():
+                        print_error(f"MySQL 启动失败：权限不足")
+                        print_info("请以管理员身份运行此脚本")
+                    else:
+                        print_error(f"MySQL 启动失败：{error_msg}")
+            except Exception as e:
+                print_error(f"MySQL 启动异常：{e}")
             
             # 启动 Neo4j
+            print_info("启动 Neo4j 容器...")
             try:
-                subprocess.run([
+                result = subprocess.run([
                     'docker', 'run', '-d',
                     '--name', 'neo4j-apt',
                     '-e', 'NEO4J_AUTH=neo4j/neo4j123',
                     '-p', '7474:7474', '-p', '7687:7687',
                     'neo4j:5.14'
-                ], check=True)
-                print_success("Neo4j Docker 容器启动成功")
-            except:
-                print_warning("Neo4j 容器可能已存在或启动失败")
-            
-            return True
+                ], capture_output=True, text=True, timeout=60)
+                
+                if result.returncode == 0:
+                    print_success("Neo4j Docker 容器启动成功")
+                    self._verify_docker_containers()
+                    return True
+                else:
+                    error_msg = result.stderr
+                    if 'port is already allocated' in error_msg.lower():
+                        print_error(f"Neo4j 启动失败：端口 7474 或 7687 被占用")
+                        print_info("请停止占用端口的程序或使用其他端口")
+                    elif 'permission denied' in error_msg.lower():
+                        print_error(f"Neo4j 启动失败：权限不足")
+                        print_info("请以管理员身份运行此脚本")
+                    else:
+                        print_error(f"Neo4j 启动失败：{error_msg}")
+                    return False
+            except Exception as e:
+                print_error(f"Neo4j 启动异常：{e}")
+                return False
+    
+    def _diagnose_docker_issue(self, error_msg: str):
+        """诊断 Docker 启动问题"""
+        print_info("\n诊断信息:")
+        
+        if 'port is already allocated' in error_msg.lower():
+            print_warning("检测到端口冲突")
+            print_info("检查端口占用情况:")
+            print_info("  Windows: netstat -ano | findstr :3306")
+            print_info("  macOS/Linux: sudo lsof -i :3306")
+        elif 'permission denied' in error_msg.lower() or 'access is denied' in error_msg.lower():
+            print_warning("检测到权限问题")
+            print_info("解决方案:")
+            print_info("  1. 以管理员身份运行此脚本")
+            print_info("  2. 或将当前用户添加到 docker 用户组")
+        elif 'cannot connect to the docker daemon' in error_msg.lower():
+            print_warning("无法连接到 Docker 守护进程")
+            print_info("解决方案:")
+            print_info("  1. 确保 Docker Desktop 已启动")
+            print_info("  2. 检查 Docker 服务状态")
+        elif 'image not found' in error_msg.lower() or 'pull access denied' in error_msg.lower():
+            print_warning("Docker 镜像拉取失败")
+            print_info("解决方案:")
+            print_info("  1. 检查网络连接")
+            print_info("  2. 配置 Docker 镜像加速器")
+        else:
+            print_info(f"错误详情：{error_msg}")
+    
+    def _verify_docker_containers(self):
+        """验证 Docker 容器是否正常运行"""
+        print_info("\n验证容器状态...")
+        try:
+            result = subprocess.run(
+                ['docker', 'ps', '--format', 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode == 0:
+                print_info("\n运行中的容器:")
+                print(result.stdout)
+                
+                # 检查关键容器
+                if 'mysql-apt' in result.stdout or 'mysql' in result.stdout.lower():
+                    print_success("MySQL 容器运行正常")
+                else:
+                    print_warning("MySQL 容器可能未运行")
+                
+                if 'neo4j-apt' in result.stdout or 'neo4j' in result.stdout.lower():
+                    print_success("Neo4j 容器运行正常")
+                else:
+                    print_warning("Neo4j 容器可能未运行")
+        except Exception as e:
+            print_warning(f"无法验证容器状态：{e}")
     
     def run_all_installs(self):
         """运行所有安装步骤"""
