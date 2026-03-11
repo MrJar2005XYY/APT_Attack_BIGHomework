@@ -575,4 +575,3 @@ provider = LLMProviderFactory.create(config)
 8. ✅ **安全存储** - API Key 加密处理
 9. ✅ **多种切换方式** - 配置文件、环境变量、API 动态切换
 
-用户只需在文档的 2.3 节中修改对应配置，即可灵活使用各种大模型服务，无需修改核心代码。
